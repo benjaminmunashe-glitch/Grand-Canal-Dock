@@ -296,7 +296,32 @@ const WEATHER_URL  = "https://api.open-meteo.com/v1/forecast?latitude=53.3441&lo
 // AI provider: Groq (OpenAI-compatible). The key is NEVER written in this file:
 // the visitor pastes it into the key box and it stays in their own browser only.
 const GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models";
+// Preferred models, best first. Groq retires models over time, so the page asks
+// Groq which models this key can use and picks the first match (or any chat model).
+const PREFERRED_MODELS = [
+  "llama-3.3-70b-versatile",
+  "openai/gpt-oss-120b",
+  "meta-llama/llama-4-maverick-17b-128e-instruct",
+  "moonshotai/kimi-k2-instruct",
+  "qwen/qwen3-32b",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "openai/gpt-oss-20b",
+  "llama-3.1-8b-instant"
+];
+let chosenModel = null;
+
+async function pickModel(key, force = false) {
+  if (chosenModel && !force) return chosenModel;
+  const res = await fetch(GROQ_MODELS_URL, { headers: { "Authorization": "Bearer " + key } });
+  if (res.status === 401) throw new Error("Groq rejected the key (401). Click 🔑 Key and paste it again.");
+  const data = await res.json().catch(() => ({}));
+  const ids = (data.data || []).filter(m => m.active !== false).map(m => m.id);
+  const chatIds = ids.filter(id => !/whisper|guard|tts|playai|orpheus|embed|distil|compound|safeguard|prompt-guard/i.test(id));
+  chosenModel = PREFERRED_MODELS.find(id => ids.includes(id)) || chatIds.sort().reverse()[0];
+  if (!chosenModel) throw new Error("No chat model is available for this Groq key.");
+  return chosenModel;
+}
 const KEY_STORE  = "askDocksideGroqKey";
 let sessionKey = "";
 function getKey() {
@@ -559,16 +584,24 @@ async function ask(question) {
       (current ? JSON.stringify(current) : "NOT AVAILABLE - do not say whether sessions will run; tell the customer to check at the desk.") +
       "\n\nCustomer question: " + question;
 
-    const res = await fetch(GROQ_URL, {
+    const callGroq = async model => fetch(GROQ_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
       body: JSON.stringify({
-        model: GROQ_MODEL,
+        model,
         temperature: 0.2,
         messages: [{ role: "system", content: SYSTEM }, { role: "user", content }]
       })
     });
-    const raw = await res.json().catch(() => ({}));
+    let model = await pickModel(key);
+    let res = await callGroq(model);
+    let raw = await res.json().catch(() => ({}));
+    // If the model was retired, refresh the model list once and retry
+    if (!res.ok && /model|decommission/i.test((raw.error && (raw.error.code + " " + raw.error.message)) || "")) {
+      model = await pickModel(key, true);
+      res = await callGroq(model);
+      raw = await res.json().catch(() => ({}));
+    }
     const reply = raw.choices && raw.choices[0] && raw.choices[0].message && raw.choices[0].message.content;
     if (!res.ok || !reply) {
       if (res.status === 401) throw new Error("Groq rejected the key (401). Click 🔑 Key and paste it again.");
@@ -580,6 +613,7 @@ async function ask(question) {
     let meta = `<span class="pill">🕒 Data fetched live at ${hhmmss(fetchedAt)}</span>`;
     if (current) meta += `<span class="pill">💨 Wind ${current.wind_speed_10m} km/h · gusts ${current.wind_gusts_10m}</span>`;
     if (wxError) meta += `<span class="pill warn">${esc(wxError)}</span>`;
+    meta += `<span class="pill">🤖 ${esc(model)}</span>`;
     if (flags.length) meta += `<span class="pill warn" title="${esc(flags.join("; "))}">⚠ ${flags.length} data checks applied</span>`;
     addMsg("bot", md(reply), { raw: true, meta });
   } catch (err) {
