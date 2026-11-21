@@ -284,7 +284,7 @@
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
       </button>
     </form>
-    <div class="fine">Answers come only from today's live sessions and Open-Meteo weather.</div>
+    <div class="fine">Answers come only from today's live sessions and Open-Meteo weather. · <span id="ver"></span></div>
   </aside>
 </div>
 
@@ -309,18 +309,36 @@ const PREFERRED_MODELS = [
   "openai/gpt-oss-20b",
   "llama-3.1-8b-instant"
 ];
-let chosenModel = null;
+const APP_VERSION = "v3 · auto-model";
+let chosenModel = null;          // the model that last worked
+const badModels = new Set();     // models Groq refused for this key
 
-async function pickModel(key, force = false) {
-  if (chosenModel && !force) return chosenModel;
-  const res = await fetch(GROQ_MODELS_URL, { headers: { "Authorization": "Bearer " + key } });
-  if (res.status === 401) throw new Error("Groq rejected the key (401). Click 🔑 Key and paste it again.");
-  const data = await res.json().catch(() => ({}));
-  const ids = (data.data || []).filter(m => m.active !== false).map(m => m.id);
-  const chatIds = ids.filter(id => !/whisper|guard|tts|playai|orpheus|embed|distil|compound|safeguard|prompt-guard/i.test(id));
-  chosenModel = PREFERRED_MODELS.find(id => ids.includes(id)) || chatIds.sort().reverse()[0];
-  if (!chosenModel) throw new Error("No chat model is available for this Groq key.");
-  return chosenModel;
+// Ordered list of models to try: the one that worked last, then preferred
+// models Groq lists for this key, then any other chat model it lists.
+async function modelCandidates(key) {
+  let ids = [];
+  try {
+    const res = await fetch(GROQ_MODELS_URL, { headers: { "Authorization": "Bearer " + key } });
+    if (res.status === 401) throw new Error("Groq rejected the key (401). Click 🔑 Key and paste it again.");
+    const data = await res.json().catch(() => ({}));
+    ids = (data.data || []).filter(m => m.active !== false).map(m => m.id);
+  } catch (e) {
+    if (/401/.test(e.message)) throw e;   // bad key: stop here
+  }
+  const isChat = id => !/whisper|guard|tts|playai|orpheus|embed|distil|compound|safeguard|allam/i.test(id);
+  const listed = PREFERRED_MODELS.filter(id => ids.includes(id));
+  const others = ids.filter(id => isChat(id) && !PREFERRED_MODELS.includes(id)).sort().reverse();
+  const order = [chosenModel, ...listed, ...others, ...PREFERRED_MODELS]   // last resort: try names blind
+    .filter(Boolean)
+    .filter((id, i, a) => a.indexOf(id) === i && !badModels.has(id));
+  return order;
+}
+
+// "This model can't be used" errors → try the next model instead of failing
+function isModelError(status, raw) {
+  const e = (raw && raw.error) || {};
+  const text = `${e.code || ""} ${e.type || ""} ${e.message || ""}`;
+  return status === 404 || /model_not_found|model_decommissioned|does not exist|decommissioned|not have access|not supported|terms acceptance|model_terms_required/i.test(text);
 }
 const KEY_STORE  = "askDocksideGroqKey";
 let sessionKey = "";
@@ -593,14 +611,21 @@ async function ask(question) {
         messages: [{ role: "system", content: SYSTEM }, { role: "user", content }]
       })
     });
-    let model = await pickModel(key);
-    let res = await callGroq(model);
-    let raw = await res.json().catch(() => ({}));
-    // If the model was retired, refresh the model list once and retry
-    if (!res.ok && /model|decommission/i.test((raw.error && (raw.error.code + " " + raw.error.message)) || "")) {
-      model = await pickModel(key, true);
-      res = await callGroq(model);
+    // Try models in order until one answers; skip any Groq refuses for this key
+    const candidates = await modelCandidates(key);
+    let model = null, res = null, raw = {};
+    const tried = [];
+    for (const m of candidates.slice(0, 8)) {
+      tried.push(m);
+      res = await callGroq(m);
       raw = await res.json().catch(() => ({}));
+      if (res.ok) { model = m; chosenModel = m; break; }
+      if (isModelError(res.status, raw)) { badModels.add(m); continue; }
+      break;   // a different error (key, rate limit…) – report it below
+    }
+    if (!model && res && res.ok === false && isModelError(res.status, raw)) {
+      throw new Error("None of these Groq models worked for your key: " + tried.join(", ") +
+        ". Open console.groq.com → Playground, check which models you can use, and tell me the name.");
     }
     const reply = raw.choices && raw.choices[0] && raw.choices[0].message && raw.choices[0].message.content;
     if (!res.ok || !reply) {
@@ -681,6 +706,7 @@ document.getElementById("credits").innerHTML = "Photos via Wikimedia Commons: " 
   ).join(" · ") +
   ". Activity photos show similar venues for illustration. Dockside Paddle Co. is fictional. Weather: Open-Meteo (CC BY 4.0).";
 
+document.getElementById("ver").textContent = APP_VERSION;
 renderActivities(null);
 refreshPanel();
 setInterval(refreshPanel, 5 * 60 * 1000);   // places change every 5 minutes
